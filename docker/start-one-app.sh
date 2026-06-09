@@ -47,6 +47,11 @@ if [[ ! -x "${SCRIPT}" ]]; then
   exit 1
 fi
 
+case "${NAME}" in
+  lumiverse) /opt/hub/docker/ensure-lumiverse.sh 2>&1 || true ;;
+  marinara)  /opt/hub/docker/ensure-marinara.sh 2>&1 || true ;;
+esac
+
 if [[ -f "${LOGPIDFILE}" ]]; then
   kill "$(cat "${LOGPIDFILE}")" 2>/dev/null || true
   rm -f "${LOGPIDFILE}"

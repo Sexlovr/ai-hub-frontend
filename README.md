@@ -45,7 +45,7 @@ HF free Spaces expose **one port (7860)** and have **16 GB RAM** with strict **C
 
 ### Option B — Paste Dockerfile only
 
-The Dockerfile is **self-contained** — it clones hub scripts from GitHub at build time. You only need **two files** in the Space:
+The **Dockerfile is thin** (~40 lines): one prebuilt SillyTavern base image + `COPY` hub files + `ENV`. Patches and Lumiverse/Marinara install run at **first boot / first open** (low HF build CPU). For paste-only deploy you still need **two files** in the Space:
 
 1. `Dockerfile` (from this repo)
 2. `README.md` (this file, including the `---` yaml block at the top)
@@ -186,7 +186,7 @@ flowchart TB
 ## Limitations
 
 - **One UI at a time** — not three simultaneous tabs on different frontends.
-- **First build is slow** — pulls ST + Marinara (`:latest`) images and compiles Lumiverse.
+- **First build is fast** — one `sillytavern:1.18.0` image pull + hub `COPY`. First **open** of Lumiverse/Marinara may take several minutes (install on demand).
 - **Free tier sleep** — Space sleeps after 48h idle; `/data` persists via storage bucket.
 - **True live sync of connections** — not built-in; characters/lorebooks are the focus.
 

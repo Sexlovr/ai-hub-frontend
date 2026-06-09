@@ -8,7 +8,7 @@ ST_CONFIG="${ST_DATA}/config/config.yaml"
 INIT_MARKER="${ST_DATA}/.npm-init-done"
 
 HUB_BUILT="/apps/sillytavern/.hub-built"
-echo "[sillytavern] starting on port ${ST_PORT} (hub repo+overlay, ST_REF=${ST_REF:-1.18.0})" >&2
+echo "[sillytavern] starting on port ${ST_PORT} (prebuilt ST ${ST_REF:-1.18.0} + hub overlay)" >&2
 cd /apps/sillytavern
 
 if [[ -x /opt/hub/overlays/sillytavern/patches/apply-patches.sh ]]; then

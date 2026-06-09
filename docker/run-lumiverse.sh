@@ -3,14 +3,18 @@ set -uo pipefail
 
 DATA_ROOT="${DATA_ROOT:-/data}"
 LUMIVERSE_PORT="${LUMIVERSE_PORT:-7861}"
-cd /apps/lumiverse
+LUMIVERSE_ROOT="${LUMIVERSE_ROOT:-/data/lumiverse-app}"
+if [[ ! -f "${LUMIVERSE_ROOT}/src/index.ts" && -d /apps/lumiverse ]]; then
+  LUMIVERSE_ROOT="/apps/lumiverse"
+fi
+cd "${LUMIVERSE_ROOT}"
 
 export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 export GIT_EXEC_PATH="${GIT_EXEC_PATH:-/usr/lib/git-core}"
 export NODE_ENV=production
 export PORT="${LUMIVERSE_PORT}"
 export DATA_DIR="${DATA_ROOT}/lumiverse"
-export FRONTEND_DIR=/apps/lumiverse/frontend/dist
+export FRONTEND_DIR="${LUMIVERSE_ROOT}/frontend/dist"
 export TRUST_ANY_ORIGIN=true
 
 # BetterAuth must use the public HTTPS URL (not localhost) behind HF proxy.
@@ -29,7 +33,7 @@ mkdir -p "${DATA_DIR}"
 bash /opt/hub/docker/patch-lumiverse-auth.sh || echo "[lumiverse] warn: optional auth patch skipped" >&2
 bash /opt/hub/docker/patch-lumiverse-sw.sh || echo "[lumiverse] warn: PWA patch failed" >&2
 # Re-apply dist subpath patches at boot (basename + /api/v1) in case image build skipped them.
-python3 - /apps/lumiverse/frontend/dist /apps/lumiverse <<'PY' || echo "[lumiverse] warn: dist subpath patch failed" >&2
+python3 - "${LUMIVERSE_ROOT}/frontend/dist" "${LUMIVERSE_ROOT}" <<'PY' || echo "[lumiverse] warn: dist subpath patch failed" >&2
 import re, sys
 from pathlib import Path
 

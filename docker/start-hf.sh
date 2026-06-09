@@ -24,6 +24,7 @@ mkdir -p "${DATA_ROOT}" "${DATA_ROOT}/.pids" \
   /tmp/nginx/body /tmp/nginx/proxy /tmp/nginx/fastcgi /tmp/nginx/uwsgi /tmp/nginx/scgi 2>/dev/null || true
 chmod -R u+rwX "${DATA_ROOT}" /tmp/nginx 2>/dev/null || true
 
+/opt/hub/docker/bootstrap-image.sh 2>&1 || echo "[hub] warn: bootstrap-image" >&2
 /opt/hub/docker/init-data-dirs.sh 2>&1 || echo "[hub] warn: init-data-dirs" >&2
 /opt/hub/docker/link-shared-data.sh 2>&1 || true
 /opt/hub/docker/init-sillytavern-data.sh 2>&1 || echo "[hub] warn: init-sillytavern-data" >&2
