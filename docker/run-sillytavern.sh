@@ -7,9 +7,14 @@ ST_DATA="${DATA_ROOT}/sillytavern"
 ST_CONFIG="${ST_DATA}/config/config.yaml"
 INIT_MARKER="${ST_DATA}/.npm-init-done"
 
-HUB_BUILT="/apps/sillytavern/.hub-built"
-echo "[sillytavern] starting on port ${ST_PORT} (prebuilt ST ${ST_REF:-1.18.0} + hub overlay)" >&2
-cd /apps/sillytavern
+ST_INSTALL="${ST_INSTALL_ROOT:-/data/st-app}"
+HUB_BUILT="${ST_INSTALL}/.hub-built"
+if [[ ! -f "${ST_INSTALL}/server.js" && -d /apps/sillytavern ]]; then
+  ST_INSTALL="/apps/sillytavern"
+  HUB_BUILT="${ST_INSTALL}/.hub-built"
+fi
+echo "[sillytavern] starting on port ${ST_PORT} (${ST_INSTALL}, ST_REF=${ST_REF:-1.18.0})" >&2
+cd "${ST_INSTALL}"
 
 if [[ -x /opt/hub/overlays/sillytavern/patches/apply-patches.sh ]]; then
   ST_ROOT=/apps/sillytavern OVERLAY=/opt/hub/overlays/sillytavern \

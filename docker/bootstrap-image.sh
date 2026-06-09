@@ -25,8 +25,11 @@ fi
 
 echo 'upstream active_backend { server 127.0.0.1:8000; }' > /opt/hub/docker/upstream.conf 2>/dev/null || true
 
-ST_ROOT="/apps/sillytavern"
-if [[ -d "${ST_ROOT}" ]]; then
+ST_ROOT="${ST_INSTALL_ROOT:-/data/st-app}"
+if [[ ! -d "${ST_ROOT}" && -d /apps/sillytavern ]]; then
+  ST_ROOT="/apps/sillytavern"
+fi
+if [[ -d "${ST_ROOT}" && -f "${ST_ROOT}/server.js" ]]; then
   touch "${ST_ROOT}/.hub-built" 2>/dev/null || true
   ST_ROOT="${ST_ROOT}" OVERLAY=/opt/hub/overlays/sillytavern \
     bash /opt/hub/overlays/sillytavern/patches/apply-patches.sh 2>&1 || true

@@ -1,26 +1,25 @@
 # =============================================================================
-# AI Frontends Hub — THIN Dockerfile for HF Spaces
-# Only: base image + COPY hub repo + ENV. Setup/patches run at boot.
-# SillyTavern: official prebuilt image (no npm/webpack at build time).
-# Lumiverse/Marinara: install on first open (ensure-*.sh).
+# AI Frontends Hub — HF paste-safe Dockerfile (no local COPY required)
+#
+# Paste this file + README.md into a Space, OR import full GitHub repo.
+# Fetches hub scripts via git clone at build (tiny). All heavy app installs
+# run on first open (ensure-*.sh), not during HF Docker build.
 # =============================================================================
 
-FROM ghcr.io/sillytavern/sillytavern:1.18.0
+FROM node:24-bookworm-slim
 
-USER root
-RUN apk add --no-cache \
-      python3 py3-pip bash curl rsync git ca-certificates \
-    && mkdir -p /tmp /apps /opt/hub \
-    && chmod 777 /tmp
+ARG HUB_REPO=https://github.com/Sexlovr/ai-hub-frontend.git
+ARG HUB_REF=main
 
-COPY docker/ /opt/hub/docker/
-COPY scripts/ /opt/hub/scripts/
-COPY config/ /opt/hub/config/
-COPY public/ /opt/hub/public/
-COPY overlays/ /opt/hub/overlays/
-
-RUN ln -sfn /home/node/app /apps/sillytavern \
-    && chown -R node:node /opt/hub
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 curl ca-certificates rsync git \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/hub /tmp /apps \
+    && chmod 777 /tmp \
+    && git clone --depth 1 --branch "${HUB_REF}" "${HUB_REPO}" /tmp/hub \
+    && cp -a /tmp/hub/docker /tmp/hub/scripts /tmp/hub/config /tmp/hub/public /tmp/hub/overlays /opt/hub/ \
+    && rm -rf /tmp/hub \
+    && chmod +x /opt/hub/docker/*.sh /opt/hub/scripts/*.sh 2>/dev/null || true
 
 USER node
 WORKDIR /home/node
@@ -32,8 +31,9 @@ ENV ST_PORT=8000
 ENV LUMIVERSE_PORT=7861
 ENV MARINARA_PORT=7862
 ENV ST_REF=1.18.0
-ENV ST_PREBUILT=1
-ENV ST_REPO_MODE=0
+ENV ST_INSTALL_ROOT=/data/st-app
+ENV ST_PREBUILT=0
+ENV ST_REPO_MODE=1
 ENV HUB_LAUNCH_MODE=lazy
 ENV HUB_STOP_IDLE=1
 ENV HUB_BOOT_APP=sillytavern

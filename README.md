@@ -5,6 +5,7 @@ colorFrom: red
 colorTo: yellow
 sdk: docker
 app_port: 7860
+startup_duration_timeout: 1h
 pinned: false
 license: mit
 ---
@@ -43,14 +44,24 @@ HF free Spaces expose **one port (7860)** and have **16 GB RAM** with strict **C
 2. **Import from GitHub** → `Sexlovr/ai-hub-frontend`
 3. Create Space → wait for build (~10–15 min)
 
-### Option B — Paste Dockerfile only
+### Option B — Paste into Space UI (Dockerfile + README only)
 
-The **Dockerfile is thin** (~40 lines): one prebuilt SillyTavern base image + `COPY` hub files + `ENV`. Patches and Lumiverse/Marinara install run at **first boot / first open** (low HF build CPU). For paste-only deploy you still need **two files** in the Space:
+The Dockerfile **git-clones this hub at build** (no `COPY` of local folders). You only upload **two files**:
 
-1. `Dockerfile` (from this repo)
-2. `README.md` (this file, including the `---` yaml block at the top)
+1. `Dockerfile`
+2. `README.md` (**must** include the `---` yaml block: `sdk: docker`, `app_port: 7860`)
 
-Do **not** paste only the Dockerfile without `README.md` — HF needs the yaml frontmatter (`sdk: docker`, `app_port: 7860`).
+Do **not** paste Dockerfile alone — missing README yaml causes **instant Paused**.
+
+### HF “Paused” pattern (read this if builds keep failing)
+
+| What you see | Meaning | Fix |
+|--------------|---------|-----|
+| **Instant Paused**, no build logs | Space wedged, missing README yaml, or paste-only broken layout | **Duplicate Space** (new slug) + paste Dockerfile **and** README; or use Option A GitHub import |
+| Build logs for a while, then pause | HF build worker OOM/timeout (heavy images, npm, parallel `FROM`) | Use current Dockerfile (node slim + git clone hub only); Factory rebuild |
+| Build OK, runtime pause, no error | CPU/RAM spike at boot (like VNC hitting 100%) | Lazy mode (default): one app at a time |
+
+If one Space slug fails instantly on every Dockerfile change, stop editing it — **create a new Space** with the same files. Same code + new slug often works (known HF 2025–2026 issue).
 
 ### After create (both options)
 
@@ -84,19 +95,15 @@ No SillyTavern fork is required — this is user-data seeding, not a missing npm
 
 ### Space got Paused instantly (no logs)?
 
-HF runs Docker Spaces as **UID 1000** (non-root). The old image used root + supervisord + nginx system mode → container died before any log appeared.
-
-**Current fix:** runs as `user` (uid 1000), lightweight build (no Lumiverse compile at build time), nginx on `/tmp` paths.
-
 | Cause | Fix |
 |-------|-----|
-| Instant pause, empty logs | Pull latest repo & **Factory rebuild** |
-| Build failed | Check **Logs** tab after rebuild |
+| **Only pasted Dockerfile** (no README yaml) | Add **README.md** with `sdk: docker` + `app_port: 7860` |
+| **Wedged Space slug** (every commit instant-pauses) | **Duplicate Space** → new slug → same Dockerfile + README |
+| Build never starts (`Build Queued` forever) | Duplicate Space or email `website@huggingface.co` |
+| Build failed mid-log | Factory rebuild; check Logs tab |
 | Storage limit exceeded | Delete Space, recreate fresh |
-| Only pasted Dockerfile | Also need `README.md` with `sdk: docker` yaml |
-| Lumiverse first open slow | Normal — builds on first switch into `/data` |
 
-After rebuild you should immediately see `[hub] HF start ...` in Logs.
+After a good boot you should see `[hub] HF start ...` then `[gateway] starting on 0.0.0.0:7860` in Logs within ~30s. SillyTavern/Lumiverse/Marinara install on **first open** (1–5 min each), not at Docker build time.
 
 ## Shared data layout
 
