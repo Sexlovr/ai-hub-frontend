@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Switching frontend…</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: system-ui, sans-serif;
+      background: #0f1117;
+      color: #e8ecf4;
+      padding: 2rem;
+      text-align: center;
+    }
+    p { max-width: 32rem; line-height: 1.5; }
+    .muted { color: #8b95a8; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div>
+    <p id="status">Switching frontend…</p>
+    <p class="muted" id="hint">Clearing cached app shell, then loading the active frontend…</p>
+  </div>
+  <script>
+    const status = document.getElementById('status');
+    const hint = document.getElementById('hint');
+    let tries = 0;
+    const parts = location.pathname.split('/').filter(Boolean);
+    const targetApp = (parts[parts.length - 1] || '').toLowerCase();
+
+    async function clearCachedAppShell() {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+    }
+
+    async function poll() {
+      tries += 1;
+      try {
+        const readyRes = await fetch('/api/ready', { cache: 'no-store' });
+        const readyData = await readyRes.json();
+        const active = (readyData.active || '').toLowerCase();
+        const label = targetApp || active || 'frontend';
+        status.textContent = `Starting ${label}… (${tries * 2}s)`;
+
+        const probes = readyData.ready || {};
+        const appKey = targetApp || active || 'sillytavern';
+        const appReady = !!probes[appKey];
+        const activeOk = !targetApp || active === targetApp;
+
+        if (appReady && activeOk) {
+          await clearCachedAppShell();
+          const bust = `_hub=${Date.now()}`;
+          const dest = appKey === 'sillytavern'
+            ? `/?${bust}`
+            : `/apps/${appKey}/?${bust}`;
+          const page = await fetch(dest, { method: 'GET', cache: 'no-store' });
+          if (page.ok) {
+            window.location.replace(dest);
+            return;
+          }
+        } else if (targetApp && active !== targetApp) {
+          status.textContent = `Waiting for switch to ${targetApp} (active: ${active || 'unknown'})…`;
+        }
+      } catch (_) {
+        status.textContent = `Waiting for backend… (${tries * 2}s)`;
+      }
+
+      if (tries > 180) {
+        hint.textContent = 'Still starting. Open /hub to pick a frontend, or refresh the app URL.';
+        return;
+      }
+      setTimeout(poll, 2000);
+    }
+
+    clearCachedAppShell().finally(poll);
+  </script>
+</body>
+</html>

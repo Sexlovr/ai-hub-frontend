@@ -1,0 +1,1231 @@
+#!/usr/bin/env python3
+"""
+Bidirectional hub sync via /data/shared (standard Tavern PNG/JSON cards).
+
+Canonical files: hub_{slug}.png — ONE global file per character name (shared database).
+- Legacy hub_{source}_{slug}.png files are merged into hub_{slug}.png on sync
+- SillyTavern reads shared cards via symlinks (no duplicate PNG copies)
+- Marinara/Lumiverse import once per character name (skip duplicates)
+"""
+from __future__ import annotations
+
+import json
+import mimetypes
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from http.cookiejar import CookieJar
+from pathlib import Path
+from uuid import uuid4
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from slug_registry import (  # noqa: E402
+    canonical_filename as registry_canonical_filename,
+    is_global_canonical as registry_is_global_canonical,
+    is_random_st_id_slug as registry_is_random_st_id_slug,
+    name_slug as registry_name_slug,
+    normalize_slug as registry_normalize_slug,
+)
+
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/data"))
+SHARED = DATA_ROOT / "shared"
+ST_CHARS = DATA_ROOT / "sillytavern" / "data" / "default-user" / "characters"
+STAGING_MARINARA = DATA_ROOT / "marinara" / "storage" / "import-staging"
+STAGING_LUMIVERSE = DATA_ROOT / "lumiverse" / "import-staging"
+STATE_DIR = DATA_ROOT / ".hub-sync"
+STATE_FILE = STATE_DIR / "import-state.json"
+MARINARA_PORT = int(os.environ.get("MARINARA_PORT", "7862"))
+LUMIVERSE_PORT = int(os.environ.get("LUMIVERSE_PORT", "7861"))
+ST_ROOT = DATA_ROOT / "sillytavern"
+MARINARA_BUILTIN_IDS = {"__professor_mari__"}
+EXPORT_ONLY = os.environ.get("HUB_SYNC_EXPORT", "").strip().lower()
+OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD") or os.environ.get("HUB_SYNC_PASSWORD", "")
+HUB_SOURCE_PREFIX_RE = re.compile(r"^hub_(st|marinara|lumiverse)_", re.I)
+GLOBAL_CANONICAL_RE = re.compile(r"^hub_[a-z][a-z0-9_]+\.png$", re.I)
+ST_ID_PREFIX_RE = re.compile(r"^[A-Za-z0-9]{6,12}\s+")
+ST_RANDOM_ID_SLUG_RE = re.compile(r"^([a-z0-9]{6,12})_")
+
+
+def is_random_st_id_slug(slug: str) -> bool:
+    return registry_is_random_st_id_slug(slug)
+
+
+def resolve_public_origin() -> str:
+    origin = (os.environ.get("PUBLIC_ORIGIN") or "").strip().rstrip("/")
+    if origin:
+        if not origin.startswith(("http://", "https://")):
+            origin = f"https://{origin}"
+        return origin
+    space_host = (os.environ.get("SPACE_HOST") or "").strip().rstrip("/")
+    if space_host:
+        space_host = space_host.removeprefix("https://").removeprefix("http://")
+        return f"https://{space_host}"
+    space_id = (os.environ.get("SPACE_ID") or "").strip()
+    if space_id:
+        return f"https://{space_id.replace('/', '-')}.hf.space"
+    return ""
+
+
+def extract_bearer_token(
+    payload: object,
+    set_cookies: list[str],
+    response_headers: object | None = None,
+) -> str | None:
+    if response_headers is not None:
+        for header_name in ("set-auth-token", "Set-Auth-Token"):
+            try:
+                token = response_headers.get(header_name)
+            except Exception:
+                token = None
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+    if isinstance(payload, dict):
+        token = payload.get("token")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        session = payload.get("session")
+        if isinstance(session, dict):
+            session_token = session.get("token")
+            if isinstance(session_token, str) and session_token.strip():
+                return session_token.strip()
+    for header in set_cookies:
+        for part in header.split(","):
+            part = part.strip()
+            for marker in (
+                "better-auth.session_token=",
+                "__Secure-better-auth.session_token=",
+            ):
+                if marker in part:
+                    return part.split(marker, 1)[1].split(";", 1)[0].strip()
+    return None
+
+
+def lumiverse_api_headers(auth_headers: dict[str, str]) -> dict[str, str]:
+    hdrs = dict(auth_headers)
+    hdrs.setdefault("Accept", "application/json")
+    hdrs["Accept-Encoding"] = "identity"
+    public_origin = resolve_public_origin()
+    if public_origin:
+        try:
+            host = public_origin.split("://", 1)[1]
+            hdrs["Host"] = host
+            hdrs["X-Forwarded-Host"] = host
+            hdrs["X-Forwarded-Proto"] = "https"
+            hdrs["X-Forwarded-Prefix"] = "/apps/lumiverse"
+        except IndexError:
+            pass
+    hdrs["X-Forwarded-For"] = "127.0.0.1"
+    hdrs["X-Real-IP"] = "127.0.0.1"
+    return hdrs
+
+
+def decode_json_response(raw: str, status: int) -> object:
+    if not raw or not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        preview = raw[:240].replace("\n", " ").replace("\r", " ")
+        return {"error": "non-json response", "preview": preview, "status": status}
+
+
+def log(msg: str) -> None:
+    print(f"[sync] {msg}", flush=True)
+
+
+def load_state() -> dict:
+    if not STATE_FILE.is_file():
+        return {"characters": {}, "world_info": {}, "exports": {}}
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"characters": {}, "world_info": {}, "exports": {}}
+    state.setdefault("characters", {})
+    state.setdefault("world_info", {})
+    state.setdefault("exports", {})
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def file_sig(path: Path) -> str:
+    st = path.stat()
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def safe_name(value: str, fallback: str = "character") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\u0000-\u001f]+', " ", value or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned[:80] if cleaned else fallback
+    return cleaned or fallback
+
+
+def name_slug(name: str) -> str:
+    return registry_name_slug(safe_name(name))
+
+
+def canonical_filename(_source: str, name: str) -> str:
+    return registry_canonical_filename(name)
+
+
+def canonical_key(_source: str, name: str) -> str:
+    return f"canonical:{name_slug(name)}"
+
+
+def is_global_canonical(name: str) -> bool:
+    return registry_is_global_canonical(name)
+
+
+def is_legacy_source_canonical(name: str) -> bool:
+    return bool(HUB_SOURCE_PREFIX_RE.match(name)) and name.lower().endswith(".png")
+
+
+def global_slug_from_filename(name: str) -> str | None:
+    if is_global_canonical(name):
+        return name[len("hub_") : -4]
+    m = re.match(r"^hub_(?:st|marinara|lumiverse)_([a-z][a-z0-9_]*)\.png$", name, re.I)
+    if m and not is_random_st_id_slug(m.group(1)):
+        return m.group(1)
+    return None
+
+
+def lumiverse_owner_username() -> str:
+    cred_path = DATA_ROOT / "lumiverse" / "owner.credentials"
+    if cred_path.is_file():
+        try:
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+            username = data.get("username")
+            if isinstance(username, str) and username.strip():
+                return username.strip()
+        except Exception:
+            pass
+    return os.environ.get("OWNER_USERNAME", "admin").strip() or "admin"
+
+
+def rsync_shared() -> None:
+    import subprocess
+
+    pairs = [
+        (SHARED / "characters", STAGING_MARINARA / "characters"),
+        (SHARED / "characters", STAGING_LUMIVERSE / "characters"),
+        (SHARED / "world_info", STAGING_MARINARA / "world_info"),
+        (SHARED / "world_info", STAGING_LUMIVERSE / "world_info"),
+        (SHARED / "connections", STAGING_MARINARA / "connections"),
+        (SHARED / "connections", STAGING_LUMIVERSE / "connections"),
+    ]
+    for src, dst in pairs:
+        src.mkdir(parents=True, exist_ok=True)
+        dst.mkdir(parents=True, exist_ok=True)
+        delete = "--delete" if src.name in {"characters", "world_info"} else ""
+        cmd = ["rsync", "-a"]
+        if delete:
+            cmd.append(delete)
+        cmd.extend([f"{src}/", f"{dst}/"])
+        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def backend_up(port: int) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def should_run_export(source: str) -> bool:
+    if not EXPORT_ONLY:
+        return True
+    return EXPORT_ONLY in {source, "all", "export", "exports"}
+
+
+def should_run_import() -> bool:
+    if EXPORT_ONLY and EXPORT_ONLY not in {"all", "import", "imports"}:
+        return False
+    return True
+
+
+def http_json(
+    method: str,
+    url: str,
+    body: dict | None = None,
+    headers: dict | None = None,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> tuple[int, object]:
+    data = None
+    hdrs = {"Accept": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    open_fn = opener.open if opener else urllib.request.urlopen
+    try:
+        with open_fn(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, decode_json_response(raw, resp.status)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw) if raw else {"error": raw}
+        except json.JSONDecodeError:
+            payload = {"error": raw or exc.reason}
+        return exc.code, payload
+
+
+def http_bytes(
+    url: str,
+    headers: dict | None = None,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> tuple[int, bytes]:
+    hdrs = headers or {}
+    req = urllib.request.Request(url, headers=hdrs, method="GET")
+    open_fn = opener.open if opener else urllib.request.urlopen
+    try:
+        with open_fn(req, timeout=300) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def multipart_batch(
+    url: str,
+    files: list[tuple[str, bytes]],
+    opener: urllib.request.OpenerDirector | None = None,
+    fields: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, object]:
+    boundary = f"hubsync-{uuid4().hex}"
+    parts: list[bytes] = []
+
+    for key, value in (fields or {}).items():
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        parts.append(f"{value}\r\n".encode())
+
+    for name, content in files:
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="files"; filename="{name}"\r\n'.encode())
+        parts.append(f"Content-Type: {mime}\r\n\r\n".encode())
+        parts.append(content)
+        parts.append(b"\r\n")
+
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req_headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Accept": "application/json",
+    }
+    if headers:
+        req_headers.update(headers)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers=req_headers,
+        method="POST",
+    )
+    open_fn = opener.open if opener else urllib.request.urlopen
+    try:
+        with open_fn(req, timeout=300) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, decode_json_response(raw, resp.status)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        return exc.code, decode_json_response(raw, exc.code)
+
+
+def _lumiverse_sign_in(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+) -> tuple[int, object, list[str], object | None]:
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    set_cookies: list[str] = []
+    try:
+        with opener.open(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            payload = decode_json_response(raw, resp.status)
+            response_headers = resp.headers
+            if hasattr(resp.headers, "get_all"):
+                set_cookies = list(resp.headers.get_all("Set-Cookie") or [])
+            elif resp.headers.get("Set-Cookie"):
+                set_cookies = [resp.headers.get("Set-Cookie", "")]
+            return resp.status, payload, set_cookies, response_headers
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw) if raw else {"error": raw}
+        except json.JSONDecodeError:
+            payload = {"error": raw or exc.reason}
+        return exc.code, payload, [], None
+
+
+def lumiverse_session() -> tuple[urllib.request.OpenerDirector, dict[str, str]] | None:
+    if not OWNER_PASSWORD:
+        log("lumiverse sync skipped — set OWNER_PASSWORD (your Lumiverse login password) in HF Secrets")
+        return None
+
+    username = lumiverse_owner_username()
+    jar = CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    base = f"http://127.0.0.1:{LUMIVERSE_PORT}"
+    public_origin = resolve_public_origin()
+    body = json.dumps({"username": username, "password": OWNER_PASSWORD}).encode("utf-8")
+
+    def sign_in_headers(origin: str, forwarded: bool = False) -> dict[str, str]:
+        hdrs = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": origin,
+        }
+        if forwarded and public_origin:
+            hdrs["X-Forwarded-Prefix"] = "/apps/lumiverse"
+            try:
+                host = public_origin.split("://", 1)[1]
+                hdrs["X-Forwarded-Host"] = host
+                hdrs["X-Forwarded-Proto"] = "https"
+            except IndexError:
+                pass
+        return hdrs
+
+    attempts: list[tuple[str, dict[str, str]]] = []
+    if public_origin:
+        attempts.append(
+            (
+                f"{public_origin.rstrip('/')}/apps/lumiverse/api/auth/sign-in/username",
+                sign_in_headers(public_origin, forwarded=True),
+            )
+        )
+    attempts.append((f"{base}/api/auth/sign-in/username", sign_in_headers(base)))
+
+    status = 0
+    payload: object = {}
+    set_cookies: list[str] = []
+    response_headers = None
+    for sign_in_url, hdrs in attempts:
+        status, payload, set_cookies, response_headers = _lumiverse_sign_in(
+            opener, sign_in_url, hdrs, body
+        )
+        if status < 400:
+            break
+        log(f"lumiverse sign-in attempt failed ({status}) via {sign_in_url}: {payload}")
+
+    if status >= 400:
+        log(f"lumiverse sign-in failed for user '{username}' ({status}): {payload}")
+        return None
+
+    auth_headers: dict[str, str] = {}
+    token = extract_bearer_token(payload, set_cookies, response_headers)
+    if token:
+        auth_headers["Authorization"] = f"Bearer {token}"
+        log(f"lumiverse auth: bearer token for '{username}'")
+
+    for attempt in range(1, 6):
+        probe_status, _ = http_json(
+            "GET",
+            f"{base}/api/v1/characters?limit=1&offset=0",
+            headers=lumiverse_api_headers(auth_headers),
+            opener=opener,
+        )
+        if probe_status < 400:
+            if not token:
+                log(f"lumiverse auth: cookie session for '{username}'")
+            return opener, lumiverse_api_headers(auth_headers)
+        if not backend_up(LUMIVERSE_PORT):
+            log(f"lumiverse auth: backend not up (attempt {attempt}/5)")
+        else:
+            log(f"lumiverse auth: probe {probe_status} (attempt {attempt}/5)")
+        time.sleep(min(attempt * 3, 15))
+
+    log("lumiverse auth failed: cookie/bearer probe exhausted retries")
+    return None
+
+
+def marinara_character_names() -> set[str]:
+    if not backend_up(MARINARA_PORT):
+        return set()
+    status, payload = http_json("GET", f"http://127.0.0.1:{MARINARA_PORT}/api/characters/")
+    if status >= 400 or not isinstance(payload, list):
+        return set()
+    names: set[str] = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        data = item.get("data")
+        name = None
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+                if isinstance(parsed, dict):
+                    name = parsed.get("name")
+            except json.JSONDecodeError:
+                pass
+        elif isinstance(data, dict):
+            name = data.get("name")
+        if name:
+            names.add(str(name).strip().lower())
+    return names
+
+
+def char_name_from_path(path: Path) -> str:
+    slug = global_slug_from_filename(path.name)
+    if slug:
+        return slug.replace("_", " ")
+    stem = path.stem
+    if HUB_SOURCE_PREFIX_RE.match(path.name):
+        parts = stem.split("_", 2)
+        if len(parts) >= 3:
+            legacy_slug = parts[2]
+            if not is_random_st_id_slug(legacy_slug):
+                return legacy_slug.replace("_", " ")
+    return st_display_name(stem)
+
+
+def st_display_name(stem: str) -> str:
+    cleaned = ST_ID_PREFIX_RE.sub("", stem).strip()
+    return cleaned or stem
+
+
+def is_valid_shared_card(name: str) -> bool:
+    if is_global_canonical(name):
+        return True
+    if is_legacy_source_canonical(name):
+        slug = global_slug_from_filename(name)
+        return slug is not None and not is_random_st_id_slug(slug)
+    return False
+
+
+def is_importable_global(name: str) -> bool:
+    return is_global_canonical(name)
+
+
+ST_QUARANTINE = DATA_ROOT / ".hub-sync" / "st-quarantine"
+
+
+def normalize_slug(slug: str) -> str:
+    return registry_normalize_slug(slug)
+
+
+def migrate_legacy_canonicals(state: dict) -> int:
+    """Merge hub_{source}_{slug}.png → hub_{slug}.png (newest file wins)."""
+    char_dir = SHARED / "characters"
+    if not char_dir.is_dir():
+        return 0
+
+    best_by_slug: dict[str, tuple[Path, float]] = {}
+    for path in char_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() != ".png":
+            continue
+        slug = global_slug_from_filename(path.name)
+        if not slug or is_random_st_id_slug(slug):
+            continue
+        slug = normalize_slug(slug)
+        mtime = path.stat().st_mtime_ns
+        prev = best_by_slug.get(slug)
+        if not prev or mtime > prev[1]:
+            best_by_slug[slug] = (path, mtime)
+
+    merged = 0
+    for slug, (src_path, _) in best_by_slug.items():
+        dest = char_dir / f"hub_{slug}.png"
+        if dest.is_file() and dest.resolve() == src_path.resolve():
+            continue
+        try:
+            if dest.is_file():
+                if dest.stat().st_mtime_ns >= src_path.stat().st_mtime_ns and dest.read_bytes() == src_path.read_bytes():
+                    pass
+                else:
+                    shutil.copy2(src_path, dest)
+            else:
+                shutil.copy2(src_path, dest)
+            name = char_name_from_path(dest)
+            ckey = canonical_key("shared", name)
+            state["exports"][ckey] = {
+                "file": f"characters/{dest.name}",
+                "filename": dest.name,
+                "updated": file_sig(dest),
+                "name": name,
+                "source_id": src_path.name,
+            }
+            state["characters"][f"characters/{dest.name}"] = file_sig(dest)
+            merged += 1
+            log(f"canonical character: characters/{dest.name} (from {src_path.name})")
+        except OSError as exc:
+            log(f"canonical merge failed for {src_path.name}: {exc}")
+
+    removed = 0
+    for path in list(char_dir.iterdir()):
+        if not path.is_file():
+            continue
+        if is_legacy_source_canonical(path.name):
+            slug = global_slug_from_filename(path.name)
+            global_path = char_dir / f"hub_{slug}.png" if slug else None
+            if global_path and global_path.is_file():
+                try:
+                    path.unlink()
+                    state["characters"].pop(f"characters/{path.name}", None)
+                    removed += 1
+                    log(f"removed legacy duplicate: characters/{path.name}")
+                except OSError as exc:
+                    log(f"legacy cleanup failed for {path.name}: {exc}")
+    return merged + removed
+
+
+def cleanup_shared_junk(state: dict) -> int:
+    char_dir = SHARED / "characters"
+    if not char_dir.is_dir():
+        return 0
+    removed = 0
+    for path in list(char_dir.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if is_valid_shared_card(path.name):
+            continue
+        try:
+            path.unlink()
+            state["characters"].pop(f"characters/{path.name}", None)
+            removed += 1
+            log(f"removed junk from shared: characters/{path.name}")
+        except OSError as exc:
+            log(f"cleanup failed for {path.name}: {exc}")
+    return removed
+
+
+def write_canonical_export(
+    state: dict,
+    source: str,
+    name: str,
+    png_bytes: bytes,
+    updated: str,
+    source_id: str,
+) -> bool:
+    char_dir = SHARED / "characters"
+    char_dir.mkdir(parents=True, exist_ok=True)
+    filename = canonical_filename(source, name)
+    rel = f"characters/{filename}"
+    dest = SHARED / rel
+    ckey = canonical_key(source, name)
+
+    prev = state["exports"].get(ckey, {})
+    old_rel = prev.get("file")
+    if old_rel and old_rel != rel:
+        old_path = SHARED / old_rel
+        if old_path.is_file():
+            try:
+                old_path.unlink()
+                state["characters"].pop(old_rel, None)
+            except OSError:
+                pass
+
+    if dest.is_file() and dest.read_bytes() == png_bytes:
+        state["exports"][ckey] = {
+            "file": rel,
+            "filename": filename,
+            "updated": updated,
+            "name": name,
+            "source_id": source_id,
+        }
+        state["characters"][rel] = file_sig(dest)
+        return False
+
+    dest.write_bytes(png_bytes)
+    state["exports"][ckey] = {
+        "file": rel,
+        "filename": filename,
+        "updated": updated,
+        "name": name,
+        "source_id": source_id,
+    }
+    state["characters"][rel] = file_sig(dest)
+    return True
+
+
+def export_marinara_to_shared(state: dict) -> int:
+    if not should_run_export("marinara"):
+        return 0
+    if not backend_up(MARINARA_PORT):
+        return 0
+
+    status, payload = http_json("GET", f"http://127.0.0.1:{MARINARA_PORT}/api/characters/")
+    if status >= 400 or not isinstance(payload, list):
+        log(f"marinara list failed ({status}): {payload}")
+        return 0
+
+    best: dict[str, dict] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        char_id = str(item.get("id") or "")
+        if not char_id or char_id in MARINARA_BUILTIN_IDS:
+            continue
+
+        updated = str(item.get("updatedAt") or item.get("updated_at") or "")
+        name = "character"
+        data = item.get("data")
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+                if isinstance(parsed, dict):
+                    name = str(parsed.get("name") or name)
+            except json.JSONDecodeError:
+                pass
+        elif isinstance(data, dict):
+            name = str(data.get("name") or name)
+
+        ckey = canonical_key("marinara", name)
+        prev = best.get(ckey)
+        if prev and prev["updated"] >= updated:
+            continue
+        best[ckey] = {"char_id": char_id, "name": name, "updated": updated}
+
+    exported = 0
+    for ckey, info in best.items():
+        prev = state["exports"].get(ckey, {})
+        if prev.get("updated") == info["updated"] and prev.get("file"):
+            if (SHARED / prev["file"]).is_file():
+                continue
+
+        png_status, png_bytes = http_bytes(
+            f"http://127.0.0.1:{MARINARA_PORT}/api/characters/{info['char_id']}/export-png"
+        )
+        if png_status >= 400 or not png_bytes:
+            log(f"marinara export failed for {info['char_id']} ({png_status})")
+            continue
+
+        if write_canonical_export(
+            state, "marinara", info["name"], png_bytes, info["updated"], info["char_id"]
+        ):
+            exported += 1
+            log(f"exported character → shared: {state['exports'][ckey]['file']}")
+
+    return exported
+
+
+def export_lumiverse_to_shared(state: dict) -> int:
+    if not should_run_export("lumiverse"):
+        return 0
+    if not backend_up(LUMIVERSE_PORT):
+        return 0
+
+    session = lumiverse_session()
+    if not session:
+        return 0
+    opener, auth_headers = session
+
+    base = f"http://127.0.0.1:{LUMIVERSE_PORT}"
+    status, payload = http_json(
+        "GET",
+        f"{base}/api/v1/characters?limit=500&offset=0",
+        headers=auth_headers,
+        opener=opener,
+    )
+    if status >= 400 or not isinstance(payload, dict):
+        log(f"lumiverse list failed ({status}): {payload}")
+        return 0
+    if payload.get("error") == "non-json response":
+        log(f"lumiverse list returned HTML/non-JSON ({status}): {payload.get('preview', '')[:120]}")
+        return 0
+
+    chars = payload.get("data") or []
+    if not isinstance(chars, list):
+        return 0
+
+    best: dict[str, dict] = {}
+    for item in chars:
+        if not isinstance(item, dict):
+            continue
+        char_id = str(item.get("id") or "")
+        if not char_id:
+            continue
+
+        updated = str(item.get("updated_at") or "")
+        name = str(item.get("name") or "character")
+        ckey = canonical_key("lumiverse", name)
+        prev = best.get(ckey)
+        if prev and str(prev["updated"]) >= updated:
+            continue
+        best[ckey] = {"char_id": char_id, "name": name, "updated": updated}
+
+    exported = 0
+    for ckey, info in best.items():
+        prev = state["exports"].get(ckey, {})
+        if prev.get("updated") == info["updated"] and prev.get("file"):
+            if (SHARED / prev["file"]).is_file():
+                continue
+
+        png_status, png_bytes = http_bytes(
+            f"{base}/api/v1/characters/{info['char_id']}/export?format=png",
+            headers=auth_headers,
+            opener=opener,
+        )
+        if png_status >= 400 or not png_bytes:
+            log(f"lumiverse export failed for {info['char_id']} ({png_status})")
+            continue
+
+        if write_canonical_export(
+            state, "lumiverse", info["name"], png_bytes, info["updated"], info["char_id"]
+        ):
+            exported += 1
+            log(f"exported character → shared: {state['exports'][ckey]['file']}")
+
+    return exported
+
+
+def sync_st_to_shared(state: dict) -> int:
+    if not ST_CHARS.is_dir():
+        return 0
+    copied = 0
+    char_dir = SHARED / "characters"
+    char_dir.mkdir(parents=True, exist_ok=True)
+
+    for path in sorted(ST_CHARS.iterdir()):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext not in {".png", ".json"}:
+            continue
+        if path.name.startswith("hub_"):
+            continue
+
+        name = st_display_name(path.stem)
+        if ext == ".png":
+            dest_name = canonical_filename("st", name)
+        else:
+            dest_name = path.name
+
+        rel = f"characters/{dest_name}"
+        sig = file_sig(path)
+        ckey = canonical_key("st", name)
+        prev = state["exports"].get(ckey, {})
+        if state["characters"].get(rel) == sig and prev.get("source_id") == path.name:
+            continue
+
+        dest = SHARED / rel
+        try:
+            if path.resolve() == dest.resolve():
+                state["characters"][f"st_src:{path.name}"] = sig
+                state["characters"][rel] = file_sig(dest)
+                state["exports"][ckey] = {
+                    "file": rel,
+                    "filename": dest_name,
+                    "updated": sig,
+                    "name": name,
+                    "source_id": path.name,
+                }
+                continue
+            shutil.copy2(path, dest)
+            state["characters"][f"st_src:{path.name}"] = sig
+            state["characters"][rel] = file_sig(dest)
+            state["exports"][ckey] = {
+                "file": rel,
+                "filename": dest_name,
+                "updated": sig,
+                "name": name,
+                "source_id": path.name,
+            }
+            copied += 1
+            log(f"exported ST character → shared: {rel}")
+        except OSError as exc:
+            log(f"ST export failed for {path.name}: {exc}")
+
+    return copied
+
+
+def st_character_names() -> set[str]:
+    names: set[str] = set()
+    if not ST_CHARS.is_dir():
+        return names
+    for path in ST_CHARS.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".png", ".json"}:
+            continue
+        if path.name.startswith("hub_"):
+            continue
+        names.add(st_display_name(path.stem).strip().lower())
+    return names
+
+
+def dedup_st_characters(state: dict) -> int:
+    """Quarantine ST random-id clones and legacy duplicates before symlink import."""
+    if not ST_CHARS.is_dir():
+        return 0
+    ST_QUARANTINE.mkdir(parents=True, exist_ok=True)
+    char_dir = SHARED / "characters"
+    canonical_slugs: set[str] = set()
+    if char_dir.is_dir():
+        for path in char_dir.iterdir():
+            if path.is_file() and is_importable_global(path.name):
+                slug = global_slug_from_filename(path.name)
+                if slug:
+                    canonical_slugs.add(normalize_slug(slug))
+
+    quarantined = 0
+    seen_display: dict[str, Path] = {}
+
+    for path in sorted(ST_CHARS.iterdir()):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() != ".png":
+            continue
+        if path.name.startswith("hub_"):
+            continue
+
+        stem_slug = name_slug(st_display_name(path.stem))
+        file_slug = name_slug(path.stem.replace(" ", "_"))
+        is_clone = (
+            is_random_st_id_slug(file_slug)
+            or (stem_slug in canonical_slugs and not path.is_symlink())
+            or stem_slug.startswith("default_")
+        )
+
+        if path.is_symlink():
+            try:
+                target = path.resolve().name
+                if is_importable_global(target):
+                    slug = normalize_slug(global_slug_from_filename(target) or stem_slug)
+                    prev = seen_display.get(slug)
+                    if prev and prev != path:
+                        quarantine_dest = ST_QUARANTINE / path.name
+                        shutil.move(str(path), str(quarantine_dest))
+                        quarantined += 1
+                        log(f"ST dedup: removed duplicate symlink {path.name}")
+                        continue
+                    seen_display[slug] = path
+            except OSError:
+                pass
+            continue
+
+        if is_clone:
+            quarantine_dest = ST_QUARANTINE / path.name
+            try:
+                if quarantine_dest.is_file():
+                    quarantine_dest.unlink()
+                shutil.move(str(path), str(quarantine_dest))
+                state["characters"].pop(f"st_src:{path.name}", None)
+                quarantined += 1
+                log(f"ST dedup: quarantined clone {path.name}")
+            except OSError as exc:
+                log(f"ST dedup failed for {path.name}: {exc}")
+
+    return quarantined
+
+
+def sync_shared_symlinks_to_st(state: dict) -> int:
+    """Link shared hub_{slug}.png into ST as {Name}.png — single on-disk copy."""
+    char_dir = SHARED / "characters"
+    if not char_dir.is_dir():
+        return 0
+    ST_CHARS.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    existing_names = st_character_names()
+
+    for path in sorted(char_dir.iterdir()):
+        if not path.is_file() or not is_importable_global(path.name):
+            continue
+
+        name = char_name_from_path(path)
+        target_name = f"{safe_name(name)}.png"
+        card_key = name.strip().lower()
+        if card_key in existing_names:
+            st_key = f"st_link:{target_name}"
+            if state["characters"].get(st_key) == file_sig(path):
+                continue
+
+        target = ST_CHARS / target_name
+        shared_abs = path.resolve()
+        try:
+            if target.is_symlink():
+                if target.resolve() == shared_abs:
+                    state["characters"][f"st_link:{target_name}"] = file_sig(path)
+                    continue
+                target.unlink()
+            elif target.is_file():
+                # Real local ST card with same filename — do not overwrite.
+                state["characters"][f"st_link:{target_name}"] = file_sig(path)
+                existing_names.add(card_key)
+                log(f"ST keep local card (not replaced): {target_name}")
+                continue
+
+            target.symlink_to(shared_abs)
+            state["characters"][f"st_link:{target_name}"] = file_sig(path)
+            existing_names.add(card_key)
+            linked += 1
+            log(f"linked shared → sillytavern: {target_name} → {path.name}")
+        except OSError as exc:
+            log(f"ST symlink failed for {path.name}: {exc}")
+
+    return linked
+
+
+def import_characters_to_marinara(state: dict) -> int:
+    char_dir = SHARED / "characters"
+    if not char_dir.is_dir():
+        return 0
+    if not backend_up(MARINARA_PORT):
+        log("marinara not running — skip marinara import")
+        return 0
+
+    existing_names = marinara_character_names()
+    pending: list[tuple[str, Path]] = []
+
+    for path in sorted(char_dir.iterdir()):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext not in {".png", ".json", ".charx"}:
+            continue
+        if not is_importable_global(path.name):
+            continue
+
+        rel = str(path.relative_to(SHARED))
+        sig = file_sig(path)
+        if state["characters"].get(rel) == sig:
+            continue
+
+        card_name = char_name_from_path(path).strip().lower()
+        if card_name and card_name in existing_names:
+            state["characters"][rel] = sig
+            log(f"marinara skip duplicate: {card_name} ({path.name})")
+            continue
+
+        pending.append((rel, path))
+
+    if not pending:
+        return 0
+
+    imported = 0
+    batch: list[tuple[str, bytes]] = []
+    batch_meta: list[str] = []
+
+    def flush_batch() -> None:
+        nonlocal imported, batch, batch_meta
+        if not batch:
+            return
+        url = f"http://127.0.0.1:{MARINARA_PORT}/api/import/st-character/batch"
+        status, payload = multipart_batch(url, batch)
+        if status >= 400:
+            log(f"marinara character batch import failed ({status}): {payload}")
+            batch = []
+            batch_meta = []
+            return
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        for rel, result in zip(batch_meta, results):
+            if result.get("success"):
+                state["characters"][rel] = file_sig(SHARED / rel)
+                imported += 1
+                log(f"imported character → marinara: {rel}")
+            else:
+                log(f"marinara import failed for {rel}: {result.get('error', 'unknown')}")
+        batch = []
+        batch_meta = []
+
+    for rel, path in pending:
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            log(f"read failed {rel}: {exc}")
+            continue
+        batch.append((path.name, content))
+        batch_meta.append(rel)
+        if len(batch) >= 10:
+            flush_batch()
+    flush_batch()
+    return imported
+
+
+def lumiverse_character_names(opener: urllib.request.OpenerDirector, auth_headers: dict[str, str]) -> set[str]:
+    base = f"http://127.0.0.1:{LUMIVERSE_PORT}"
+    status, payload = http_json(
+        "GET",
+        f"{base}/api/v1/characters?limit=500&offset=0",
+        headers=auth_headers,
+        opener=opener,
+    )
+    if status >= 400 or not isinstance(payload, dict):
+        return set()
+    chars = payload.get("data") or []
+    names: set[str] = set()
+    if isinstance(chars, list):
+        for item in chars:
+            if isinstance(item, dict) and item.get("name"):
+                names.add(str(item["name"]).strip().lower())
+    return names
+
+
+def import_characters_to_lumiverse(state: dict) -> int:
+    char_dir = SHARED / "characters"
+    if not char_dir.is_dir():
+        return 0
+    if not backend_up(LUMIVERSE_PORT):
+        return 0
+
+    session = lumiverse_session()
+    if not session:
+        return 0
+    opener, auth_headers = session
+    existing_names = lumiverse_character_names(opener, auth_headers)
+
+    pending: list[tuple[str, Path]] = []
+    for path in sorted(char_dir.iterdir()):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext not in {".png", ".json", ".charx"}:
+            continue
+        if not is_importable_global(path.name):
+            continue
+
+        rel = str(path.relative_to(SHARED))
+        sig = file_sig(path)
+        if state["characters"].get(rel) == sig:
+            continue
+
+        card_name = char_name_from_path(path).strip().lower()
+        if card_name and card_name in existing_names:
+            state["characters"][rel] = sig
+            log(f"lumiverse skip duplicate: {card_name} ({path.name})")
+            continue
+
+        pending.append((rel, path))
+
+    if not pending:
+        return 0
+
+    imported = 0
+    batch: list[tuple[str, bytes]] = []
+    batch_meta: list[str] = []
+
+    def flush_batch() -> None:
+        nonlocal imported, batch, batch_meta
+        if not batch:
+            return
+        url = f"http://127.0.0.1:{LUMIVERSE_PORT}/api/v1/characters/import-bulk"
+        status, payload = multipart_batch(
+            url,
+            batch,
+            opener=opener,
+            fields={"skip_duplicates": "true"},
+            headers=auth_headers,
+        )
+        if status >= 400:
+            log(f"lumiverse character batch import failed ({status}): {payload}")
+            batch = []
+            batch_meta = []
+            return
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        for rel, result in zip(batch_meta, results):
+            if result.get("success"):
+                state["characters"][rel] = file_sig(SHARED / rel)
+                if not result.get("skipped"):
+                    imported += 1
+                    log(f"imported character → lumiverse: {rel}")
+                else:
+                    log(f"lumiverse skipped duplicate: {rel}")
+            else:
+                log(f"lumiverse import failed for {rel}: {result.get('error', 'unknown')}")
+        batch = []
+        batch_meta = []
+
+    for rel, path in pending:
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            log(f"read failed {rel}: {exc}")
+            continue
+        batch.append((path.name, content))
+        batch_meta.append(rel)
+        if len(batch) >= 10:
+            flush_batch()
+    flush_batch()
+    return imported
+
+
+def import_lorebooks_to_marinara(state: dict) -> int:
+    world_dir = SHARED / "world_info"
+    if not world_dir.is_dir():
+        return 0
+    if not backend_up(MARINARA_PORT):
+        return 0
+
+    imported = 0
+    for path in sorted(world_dir.glob("*.json")):
+        rel = str(path.relative_to(SHARED))
+        sig = file_sig(path)
+        if state["world_info"].get(rel) == sig:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log(f"skip lorebook {rel}: {exc}")
+            continue
+        payload["__filename"] = path.name
+        url = f"http://127.0.0.1:{MARINARA_PORT}/api/import/st-lorebook"
+        status, result = http_json("POST", url, payload)
+        if status < 400 and isinstance(result, dict) and result.get("success", True):
+            state["world_info"][rel] = sig
+            imported += 1
+            log(f"imported lorebook → marinara: {rel}")
+        else:
+            log(f"marinara lorebook import failed for {rel} ({status}): {result}")
+    return imported
+
+
+def main() -> int:
+    try:
+        log(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} syncing shared library")
+        state = load_state()
+        cleanup_shared_junk(state)
+        migrate_legacy_canonicals(state)
+
+        n_export_marinara = export_marinara_to_shared(state)
+        n_export_lumiverse = export_lumiverse_to_shared(state)
+        n_export_st = sync_st_to_shared(state)
+
+        n_dedup = 0
+        if should_run_import():
+            rsync_shared()
+            n_dedup = dedup_st_characters(state)
+            if n_dedup:
+                log(f"ST dedup quarantined {n_dedup} file(s)")
+            n_chars_marinara = import_characters_to_marinara(state)
+            n_chars_lumiverse = import_characters_to_lumiverse(state)
+            n_chars_st = sync_shared_symlinks_to_st(state)
+            n_worlds = import_lorebooks_to_marinara(state)
+        else:
+            n_chars_marinara = 0
+            n_chars_lumiverse = 0
+            n_chars_st = 0
+            n_worlds = 0
+
+        save_state(state)
+        log(
+            "done — "
+            f"exported: marinara +{n_export_marinara}, lumiverse +{n_export_lumiverse}, st +{n_export_st}; "
+            f"imported: marinara +{n_chars_marinara}, lumiverse +{n_chars_lumiverse}, "
+            f"st +{n_chars_st}, lorebooks +{n_worlds}"
+            + (f"; dedup +{n_dedup}" if n_dedup else "")
+        )
+        return 0
+    except Exception as exc:
+        log(f"sync fatal error: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

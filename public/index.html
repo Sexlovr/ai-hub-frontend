@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Frontends Hub</title>
+  <link rel="icon" href="/hub/favicon.ico" type="image/x-icon" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1117;
+      --card: #1a1f2e;
+      --accent: #ff6b4a;
+      --accent2: #4ecdc4;
+      --text: #e8ecf4;
+      --muted: #8b95a8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: radial-gradient(ellipse at top, #1b2236, var(--bg));
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    main { width: min(720px, 100%); }
+    h1 { margin: 0 0 0.5rem; font-size: 1.8rem; }
+    p.lead { color: var(--muted); margin: 0 0 2rem; line-height: 1.5; }
+    .grid { display: grid; gap: 1rem; }
+    @media (min-width: 600px) {
+      .grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    a.card {
+      display: block;
+      background: var(--card);
+      border: 1px solid #2a3348;
+      border-radius: 14px;
+      padding: 1.25rem;
+      text-decoration: none;
+      color: inherit;
+      transition: transform 0.15s, border-color 0.15s;
+      cursor: pointer;
+    }
+    a.card:hover {
+      transform: translateY(-2px);
+      border-color: var(--accent);
+    }
+    a.card strong { display: block; font-size: 1.1rem; margin-bottom: 0.35rem; }
+    a.card span { color: var(--muted); font-size: 0.9rem; line-height: 1.4; }
+    .badge {
+      display: inline-block;
+      margin-top: 2rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 999px;
+      background: #243049;
+      color: var(--accent2);
+      font-size: 0.85rem;
+    }
+    footer {
+      margin-top: 2rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    code { font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AI Frontends Hub</h1>
+    <p class="lead">
+      <strong>Lazy mode:</strong> only one frontend runs at a time (saves HF CPU/RAM).
+      Opening a card starts that app; others stay stopped until you open them.
+    </p>
+    <p class="lead" style="margin-top:-1.25rem;font-size:0.9rem;">
+      Characters live in one shared library: <code>/data/shared/characters/hub_{name}.png</code>
+      (one file per character, no per-app clones).
+    </p>
+    <div class="grid">
+      <a class="card" href="/" target="_blank" rel="noopener noreferrer">
+        <strong>SillyTavern</strong>
+        <span>Classic ST UI at / — native paths, no subpath hacks.</span>
+      </a>
+      <a class="card" href="/apps/lumiverse/" target="_blank" rel="noopener noreferrer">
+        <strong>Lumiverse</strong>
+        <span>Bun + SQLite. Imports from shared library once.</span>
+      </a>
+      <a class="card" href="/apps/marinara/" target="_blank" rel="noopener noreferrer">
+        <strong>Marinara Engine</strong>
+        <span>Roleplay engine. Imports from shared library once.</span>
+      </a>
+    </div>
+    <div class="badge" id="status">Checking backends…</div>
+    <footer>
+      Hub launcher: <code>/hub</code> or <code>/api/hub</code>.
+      Apps: SillyTavern <code>/</code>,
+      Lumiverse <code>/apps/lumiverse/</code>,
+      Marinara <code>/apps/marinara/</code>.
+    </footer>
+  </main>
+  <script>
+    (async function clearLumiversePwa() {
+      if (!('serviceWorker' in navigator)) return;
+      try {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        }
+      } catch (_) { /* ignore */ }
+    })();
+
+    fetch('/api/ready').then(r => r.json()).then(d => {
+      const apps = d.ready || {};
+      const up = Object.entries(apps).filter(([, v]) => v).map(([k]) => k);
+      const el = document.getElementById('status');
+      el.textContent = up.length
+        ? `Running now: ${up.join(', ')} (others start on first open)`
+        : 'Gateway up — open an app to start it (first load ~1–3 min)';
+    }).catch(() => {
+      document.getElementById('status').textContent = 'Hub API starting…';
+    });
+  </script>
+</body>
+</html>

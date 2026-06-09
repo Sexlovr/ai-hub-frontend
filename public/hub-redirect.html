@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="refresh" content="0;url=/api/hub" />
+  <title>AI Frontends Hub</title>
+  <script>
+    (async function () {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+      location.replace('/api/hub');
+    })();
+  </script>
+</head>
+<body>
+  <p>Redirecting to <a href="/api/hub">/api/hub</a>…</p>
+</body>
+</html>
